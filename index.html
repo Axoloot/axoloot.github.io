@@ -25,6 +25,10 @@
   label { display:flex; align-items:center; gap:10px; font-size:15px; }
   input[type=range] { width:100%; margin-top:12px; }
   .hidden { display:none; }
+  .seg { display:flex; gap:8px; }
+  .seg button { margin:0; padding:12px; font-size:15px; background:#2a2a2a; color:var(--fg); }
+  .seg button.on { background:var(--acc); color:#fff; }
+  .hint { color:var(--dim); font-size:13px; margin-top:10px; }
   small { color:var(--dim); display:block; margin-top:16px; line-height:1.4; }
 </style>
 </head>
@@ -33,7 +37,7 @@
   <div class="speed" id="speed">0</div>
   <div class="unit">km/h <span id="src"></span></div>
 
-  <div class="row"><span>Motor</span><span id="dutyTxt">–</span></div>
+  <div class="row"><span>Strength</span><span id="dutyTxt">–</span></div>
   <div class="bar"><div id="dutyBar"></div></div>
 
   <button id="connectBtn">Connect</button>
@@ -41,7 +45,23 @@
 
   <div class="card">
     <label><input type="checkbox" id="testMode"> Test mode (ignore GPS)</label>
-    <input type="range" id="testSlider" min="0" max="150" value="0" class="hidden">
+    <input type="range" id="testSlider" min="0" max="200" value="0" class="hidden">
+  </div>
+
+  <div class="card">
+    <div class="seg">
+      <button id="modeLevels" class="on">Levels</button>
+      <button id="modeDirect">Direct 1–9</button>
+    </div>
+    <div class="hint" id="modeHint">0–20 off · 20–50 L1 · 50–100 L2 · 100–150 L3 · 150+ L4</div>
+  </div>
+
+  <div class="card">
+    <label><input type="checkbox" id="manualMode"> Manual strength (ignore speed)</label>
+    <div id="manualBox" class="hidden">
+      <div class="row" style="margin-top:10px"><span>Strength</span><span id="manualVal">0</span></div>
+      <input type="range" id="manualSlider" min="0" max="9" step="1" value="0">
+    </div>
   </div>
 
   <small>Keep this page open and the screen on while riding.
@@ -51,9 +71,10 @@
 const SERVICE  = '6e1d0001-8b2a-4c1e-9f3a-5a7d2c4b9e10';
 const SPEED_CH = '6e1d0002-8b2a-4c1e-9f3a-5a7d2c4b9e10';
 const DUTY_CH  = '6e1d0003-8b2a-4c1e-9f3a-5a7d2c4b9e10';
+const CTRL_CH  = '6e1d0004-8b2a-4c1e-9f3a-5a7d2c4b9e10';
 
 const $ = id => document.getElementById(id);
-let device = null, speedChar = null, gpsWatch = null, wakeLock = null;
+let device = null, speedChar = null, ctrlChar = null, mode = 0, gpsWatch = null, wakeLock = null;
 let kmh = 0, lastFix = null, writing = false, userDisconnect = false;
 
 function setStatus(t, cls='') { const s = $('status'); s.textContent = t; s.className = 'status ' + cls; }
@@ -112,16 +133,21 @@ async function openGatt() {
   const server = await device.gatt.connect();
   const svc = await server.getPrimaryService(SERVICE);
   speedChar = await svc.getCharacteristic(SPEED_CH);
+  try { ctrlChar = await svc.getCharacteristic(CTRL_CH); } catch (_) { ctrlChar = null; }
   try {
     const d = await svc.getCharacteristic(DUTY_CH);
     await d.startNotifications();
     d.addEventListener('characteristicvaluechanged', e => {
-      const pct = e.target.value.getUint8(0);
-      $('dutyTxt').textContent = pct + ' %';
+      const v = e.target.value;
+      const pct = v.getUint8(0);
+      const str = v.byteLength > 1 ? v.getUint8(1) : null;
+      $('dutyTxt').textContent = str == null ? pct + ' %' : (str === 0 ? 'off' : str + ' / 9');
       $('dutyBar').style.width = pct + '%';
     });
   } catch (_) {}
   setStatus('Connected to ' + (device.name || 'device'), 'ok');
+  await ctrl(1, mode);                                   // push current mode
+  if ($('manualMode').checked) await ctrl(2, +$('manualSlider').value);
   send();
 }
 
@@ -158,6 +184,14 @@ async function send() {
   writing = false;
 }
 
+// Control: [cmd, value]  cmd 1 = mode (0 levels / 1 direct), cmd 2 = manual (0..9, 255 = off)
+let ctrlBusy = Promise.resolve();
+function ctrl(cmd, val) {
+  if (!ctrlChar) return Promise.resolve();
+  ctrlBusy = ctrlBusy.then(() => ctrlChar.writeValue(new Uint8Array([cmd, val]))).catch(() => {});
+  return ctrlBusy;
+}
+
 // Keepalive: ESP32 stops the motor if nothing arrives for 3 s
 setInterval(send, 1000);
 
@@ -178,6 +212,25 @@ $('testMode').onchange = e => {
   kmh = e.target.checked ? +$('testSlider').value : 0;
   $('src').textContent = e.target.checked ? '· TEST' : '';
   render(); send();
+};
+function setMode(m) {
+  mode = m;
+  $('modeLevels').classList.toggle('on', m === 0);
+  $('modeDirect').classList.toggle('on', m === 1);
+  $('modeHint').textContent = m === 0
+    ? '0–20 off · 20–50 L1 · 50–100 L2 · 100–150 L3 · 150+ L4'
+    : 'Below 20 off · 20 → 150 km/h scales strength 1 → 9';
+  ctrl(1, m);
+}
+$('modeLevels').onclick = () => setMode(0);
+$('modeDirect').onclick = () => setMode(1);
+$('manualMode').onchange = e => {
+  $('manualBox').classList.toggle('hidden', !e.target.checked);
+  ctrl(2, e.target.checked ? +$('manualSlider').value : 255);
+};
+$('manualSlider').oninput = e => {
+  $('manualVal').textContent = e.target.value;
+  if ($('manualMode').checked) ctrl(2, +e.target.value);
 };
 $('testSlider').oninput = e => { kmh = +e.target.value; render(); send(); };
 </script>
