@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111">
+<title>Speed Motor</title>
+<style>
+  :root { --bg:#111; --fg:#f2f2f2; --dim:#888; --acc:#e63b2e; --ok:#3ccf6e; --card:#1c1c1c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system,system-ui,sans-serif;
+         padding:16px; padding-top:max(16px, env(safe-area-inset-top)); text-align:center; }
+  h1 { font-size:18px; font-weight:600; margin:4px 0 12px; color:var(--dim); letter-spacing:.05em; }
+  .speed { font-size:96px; font-weight:700; line-height:1; font-variant-numeric:tabular-nums; }
+  .unit { color:var(--dim); font-size:18px; margin-bottom:20px; }
+  .bar { height:18px; background:var(--card); border-radius:9px; overflow:hidden; margin:8px 0 4px; }
+  .bar > div { height:100%; width:0; background:var(--acc); transition:width .25s; }
+  .row { display:flex; justify-content:space-between; color:var(--dim); font-size:14px; }
+  button { width:100%; padding:18px; font-size:18px; font-weight:600; border:0; border-radius:14px;
+           background:var(--acc); color:#fff; margin-top:20px; }
+  button.secondary { background:var(--card); color:var(--fg); }
+  .status { margin-top:14px; font-size:15px; }
+  .status.ok { color:var(--ok); } .status.err { color:var(--acc); }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin-top:20px; text-align:left; }
+  label { display:flex; align-items:center; gap:10px; font-size:15px; }
+  input[type=range] { width:100%; margin-top:12px; }
+  .hidden { display:none; }
+  small { color:var(--dim); display:block; margin-top:16px; line-height:1.4; }
+</style>
+</head>
+<body>
+  <h1>SPEED MOTOR</h1>
+  <div class="speed" id="speed">0</div>
+  <div class="unit">km/h <span id="src"></span></div>
+
+  <div class="row"><span>Motor</span><span id="dutyTxt">–</span></div>
+  <div class="bar"><div id="dutyBar"></div></div>
+
+  <button id="connectBtn">Connect</button>
+  <div class="status" id="status">Not connected</div>
+
+  <div class="card">
+    <label><input type="checkbox" id="testMode"> Test mode (ignore GPS)</label>
+    <input type="range" id="testSlider" min="0" max="150" value="0" class="hidden">
+  </div>
+
+  <small>Keep this page open and the screen on while riding.
+  Android: Chrome. iPhone: use the Bluefy browser (Safari has no Bluetooth).</small>
+
+<script>
+const SERVICE  = '6e1d0001-8b2a-4c1e-9f3a-5a7d2c4b9e10';
+const SPEED_CH = '6e1d0002-8b2a-4c1e-9f3a-5a7d2c4b9e10';
+const DUTY_CH  = '6e1d0003-8b2a-4c1e-9f3a-5a7d2c4b9e10';
+
+const $ = id => document.getElementById(id);
+let device = null, speedChar = null, gpsWatch = null, wakeLock = null;
+let kmh = 0, lastFix = null, writing = false, userDisconnect = false;
+
+function setStatus(t, cls='') { const s = $('status'); s.textContent = t; s.className = 'status ' + cls; }
+
+// ---------- GPS ----------
+function startGps() {
+  if (!('geolocation' in navigator)) { setStatus('No GPS available', 'err'); return; }
+  gpsWatch = navigator.geolocation.watchPosition(onFix,
+    e => setStatus('GPS error: ' + e.message, 'err'),
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 });
+}
+
+function onFix(p) {
+  if ($('testMode').checked) return;
+  let v = p.coords.speed;                        // m/s, may be null
+  if (v == null && lastFix) {                    // fallback: distance / time
+    const dt = (p.timestamp - lastFix.timestamp) / 1000;
+    if (dt > 0) v = haversine(lastFix.coords, p.coords) / dt;
+  }
+  lastFix = p;
+  if (v == null || v < 0) v = 0;
+  kmh = v * 3.6;
+  if (kmh < 2) kmh = 0;                          // GPS jitter when stopped
+  $('src').textContent = '· GPS ±' + Math.round(p.coords.accuracy) + ' m';
+  render(); send();
+}
+
+function haversine(a, b) {
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const dLat = r(b.latitude - a.latitude), dLon = r(b.longitude - a.longitude);
+  const h = Math.sin(dLat/2)**2 + Math.cos(r(a.latitude))*Math.cos(r(b.latitude))*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// ---------- Bluetooth ----------
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus('Bluetooth not supported here. Use Chrome (Android) or Bluefy (iPhone).', 'err');
+    return;
+  }
+  try {
+    setStatus('Searching…');
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    userDisconnect = false;
+    await openGatt();
+    startGps();
+    keepAwake();
+    $('connectBtn').textContent = 'Disconnect';
+    $('connectBtn').className = 'secondary';
+  } catch (e) { setStatus(e.message, 'err'); }
+}
+
+async function openGatt() {
+  setStatus('Connecting…');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SERVICE);
+  speedChar = await svc.getCharacteristic(SPEED_CH);
+  try {
+    const d = await svc.getCharacteristic(DUTY_CH);
+    await d.startNotifications();
+    d.addEventListener('characteristicvaluechanged', e => {
+      const pct = e.target.value.getUint8(0);
+      $('dutyTxt').textContent = pct + ' %';
+      $('dutyBar').style.width = pct + '%';
+    });
+  } catch (_) {}
+  setStatus('Connected to ' + (device.name || 'device'), 'ok');
+  send();
+}
+
+async function onDisconnected() {
+  speedChar = null;
+  $('dutyTxt').textContent = '–'; $('dutyBar').style.width = '0';
+  if (userDisconnect) return;
+  setStatus('Link lost – reconnecting…', 'err');
+  for (let i = 0; i < 20 && !userDisconnect; i++) {      // auto-reconnect
+    try { await openGatt(); return; } catch (_) { await new Promise(r => setTimeout(r, 1500)); }
+  }
+  setStatus('Could not reconnect. Tap Connect.', 'err');
+}
+
+function disconnect() {
+  userDisconnect = true;
+  if (gpsWatch != null) navigator.geolocation.clearWatch(gpsWatch);
+  gpsWatch = null;
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  $('connectBtn').textContent = 'Connect'; $('connectBtn').className = '';
+  setStatus('Not connected');
+}
+
+async function send() {
+  if (!speedChar || writing) return;
+  writing = true;
+  const raw = Math.max(0, Math.min(65535, Math.round(kmh * 10)));
+  const buf = new Uint8Array([raw & 0xff, raw >> 8]);
+  try {
+    if (speedChar.writeValueWithoutResponse) await speedChar.writeValueWithoutResponse(buf);
+    else await speedChar.writeValue(buf);
+  } catch (_) {}
+  writing = false;
+}
+
+// Keepalive: ESP32 stops the motor if nothing arrives for 3 s
+setInterval(send, 1000);
+
+// ---------- Screen wake lock ----------
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (_) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && speedChar) keepAwake();
+});
+
+// ---------- UI ----------
+function render() { $('speed').textContent = Math.round(kmh); }
+
+$('connectBtn').onclick = () => (device && device.gatt.connected) ? disconnect() : connect();
+$('testMode').onchange = e => {
+  $('testSlider').classList.toggle('hidden', !e.target.checked);
+  kmh = e.target.checked ? +$('testSlider').value : 0;
+  $('src').textContent = e.target.checked ? '· TEST' : '';
+  render(); send();
+};
+$('testSlider').oninput = e => { kmh = +e.target.value; render(); send(); };
+</script>
+</body>
+</html>
